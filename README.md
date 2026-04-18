@@ -148,8 +148,10 @@ telecom-network-anomaly-detection/
 ├── main.py                         # Orchestrator: generate → preprocess → train → evaluate
 ├── benchmark.py                    # Standalone benchmark with dedicated result plots
 ├── pipeline.py                     # Live simulation (real-time telemetry replay)
+├── predict.py                      # Inference script — score any telemetry CSV out of the box
+├── requirements.txt                # Python dependencies
 ├── data/                           # telemetry.csv + anomaly_labels.csv  (auto-generated)
-├── checkpoints/                    # best_model.pt, scaler.pkl, threshold.npy
+├── checkpoints/                    # best_model.pt, scaler.pkl, threshold.npy  (pre-trained)
 └── results/                        # PNG dashboards + benchmark_comparison.csv
 ```
 
@@ -160,13 +162,43 @@ telecom-network-anomaly-detection/
 ### 1. Install dependencies
 
 ```bash
-pip install torch numpy pandas scikit-learn matplotlib joblib
+pip install -r requirements.txt
 ```
 
 > **Apple Silicon (MPS):** PyTorch ≥ 2.0 required.  
 > **NVIDIA CUDA:** Install the matching `torch` build from [pytorch.org](https://pytorch.org).
 
-### 2. Run the full pipeline
+### 2. Run inference on your own data (pre-trained model included)
+
+Pre-trained weights (`best_model.pt`), the fitted scaler (`scaler.pkl`), and the anomaly threshold (`threshold.npy`) are committed to the repo under `checkpoints/` — no training required.
+
+```bash
+python predict.py --input your_telemetry.csv
+```
+
+This writes `your_telemetry_predictions.csv` with three columns:
+
+| timestamp | anomaly_score | is_anomaly |
+|---|---|---|
+| 2024-01-15 08:00 | 0.012431 | 0 |
+| 2024-01-15 08:01 | 0.341780 | 1 |
+
+**Options:**
+
+```bash
+# Save predictions to a custom path
+python predict.py --input data.csv --output flagged.csv
+
+# Override the threshold (higher = fewer alerts, lower = more sensitive)
+python predict.py --input data.csv --threshold 0.08
+```
+
+**Input CSV requirements:** must contain all 37 KPI columns listed in `config.py`. A `timestamp` column is optional but recommended.  
+The first 23 rows (one window − 1) produce no score while the sliding window warms up.
+
+---
+
+### 3. Run the full training pipeline
 
 ```bash
 python main.py
@@ -180,7 +212,7 @@ This will:
 5. Compute anomaly threshold — mean + 5σ of training reconstruction errors
 6. Evaluate on test split; save all plots + CSV to `results/`
 
-### 3. Run the live simulation
+### 4. Run the live simulation
 
 ```bash
 python pipeline.py
@@ -188,7 +220,7 @@ python pipeline.py
 
 Replays test telemetry at 100× real-time speed, printing anomaly alerts as they fire.
 
-### 4. Standalone benchmark
+### 5. Standalone benchmark
 
 ```bash
 python benchmark.py

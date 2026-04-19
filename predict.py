@@ -1,20 +1,22 @@
-# predict.py — Run inference on any telemetry CSV using the pre-trained model
+# predict.py — Batch inference using the weighted ensemble detector
 #
 # Usage:
 #   python predict.py --input my_telemetry.csv
 #   python predict.py --input my_telemetry.csv --output results.csv
-#   python predict.py --input my_telemetry.csv --threshold 0.08
+#   python predict.py --input my_telemetry.csv --threshold 0.6
 #
 # Input CSV must contain the 37 KPI columns defined in config.py.
 # A 'timestamp' column is optional but recommended.
 #
 # Output CSV columns:
-#   timestamp | anomaly_score | is_anomaly
+#   timestamp | ensemble_score | is_anomaly | transformer_score | mlp_score | if_score
 #
 # Pre-trained artefacts loaded from checkpoints/ (included in the repo):
-#   best_model.pt   — trained Transformer Autoencoder weights
-#   scaler.pkl      — StandardScaler fitted on training data
-#   threshold.npy   — anomaly threshold (mean + 5σ of training errors)
+#   best_model.pt          — Transformer Autoencoder weights
+#   mlp_model.pt           — MLP Autoencoder weights
+#   isolation_forest.pkl   — Isolation Forest model + calibration
+#   ensemble_params.pkl    — per-model normalisation bounds
+#   scaler.pkl             — StandardScaler fitted on training data
 
 import os
 import sys
@@ -26,35 +28,49 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import Config, get_device
-from models import build_model
-from detector import AnomalyDetector
+from models import build_model, build_mlp_model, IsolationForestScorer
+from ensemble import EnsembleDetector
 import joblib
 
 
 # ─────────────────────────────────────────────────────────────
-# Loader
+# Load all artefacts
 # ─────────────────────────────────────────────────────────────
 
-def load_artefacts(cfg: Config, device: str):
-    """Load model weights, scaler, and threshold from checkpoints/."""
-    model_path     = cfg.MODEL_PATH
-    scaler_path    = "checkpoints/scaler.pkl"
-    threshold_path = "checkpoints/threshold.npy"
+def load_ensemble(cfg: Config, device: str) -> EnsembleDetector:
+    required = {
+        "Transformer weights":  cfg.MODEL_PATH,
+        "MLP weights":          cfg.MLP_MODEL_PATH,
+        "Isolation Forest":     cfg.IF_PATH,
+        "Ensemble calibration": cfg.ENSEMBLE_PATH,
+        "Scaler":               "checkpoints/scaler.pkl",
+    }
+    missing = [name for name, path in required.items() if not os.path.exists(path)]
+    if missing:
+        print("[ERROR] Missing pre-trained artefacts:")
+        for m in missing:
+            print(f"        - {m}")
+        print("\n  Run  python main.py  first to train all models.")
+        sys.exit(1)
 
-    for path in [model_path, scaler_path, threshold_path]:
-        if not os.path.exists(path):
-            print(f"[ERROR] Required artefact not found: {path}")
-            print("        Run  python main.py  first to train the model.")
-            sys.exit(1)
+    n_features = len(cfg.KPI_COLUMNS)
 
-    model = build_model(cfg, input_dim=len(cfg.KPI_COLUMNS))
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
+    transformer = build_model(cfg, input_dim=n_features)
+    transformer.load_state_dict(torch.load(cfg.MODEL_PATH, map_location=device))
 
-    scaler    = joblib.load(scaler_path)
-    threshold = float(np.load(threshold_path))
+    mlp_ae = build_mlp_model(cfg, input_dim=n_features)
+    mlp_ae.load_state_dict(torch.load(cfg.MLP_MODEL_PATH, map_location=device))
 
-    return model, scaler, threshold
+    if_scorer = IsolationForestScorer.load(cfg.IF_PATH)
+
+    detector = EnsembleDetector(transformer, mlp_ae, if_scorer, cfg, device)
+    detector.load_calibration(cfg.ENSEMBLE_PATH)
+
+    return detector
+
+
+def load_scaler(path: str = "checkpoints/scaler.pkl"):
+    return joblib.load(path)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -67,9 +83,6 @@ def validate_input(df: pd.DataFrame, cfg: Config):
         print(f"[ERROR] Input CSV is missing {len(missing)} required KPI column(s):")
         for col in missing:
             print(f"        - {col}")
-        print("\n  Required columns:")
-        for col in cfg.KPI_COLUMNS:
-            print(f"        {col}")
         sys.exit(1)
 
 
@@ -77,27 +90,39 @@ def validate_input(df: pd.DataFrame, cfg: Config):
 # Inference
 # ─────────────────────────────────────────────────────────────
 
-def run_inference(df: pd.DataFrame, model, scaler, threshold: float,
-                  cfg: Config, device: str) -> pd.DataFrame:
-    """
-    Scale the input, score every sliding window, return results DataFrame.
-    The first (WINDOW_SIZE - 1) rows cannot form a complete window and get
-    score = 0.0 / is_anomaly = False.
-    """
+def run_inference(df: pd.DataFrame, detector: EnsembleDetector,
+                  scaler, cfg: Config) -> pd.DataFrame:
     scaled = scaler.transform(df[cfg.KPI_COLUMNS].values)
 
-    detector = AnomalyDetector(model, threshold, cfg, device=device)
-    scores   = detector.score_array(scaled)          # shape (n,)
-    flags    = (scores > threshold).astype(int)
+    n      = len(scaled)
+    W      = cfg.WINDOW_SIZE
+    rows   = []
 
-    results = pd.DataFrame({
-        "anomaly_score": np.round(scores, 6),
-        "is_anomaly":    flags,
-    })
+    for i in range(n):
+        if i < W - 1:
+            rows.append({
+                "ensemble_score":    0.0,
+                "is_anomaly":        0,
+                "transformer_score": 0.0,
+                "mlp_score":         0.0,
+                "if_score":          0.0,
+            })
+            continue
 
+        window = scaled[i - W + 1 : i + 1]
+        result = detector.score_window(window)
+
+        rows.append({
+            "ensemble_score":    round(result["ensemble_score"], 6),
+            "is_anomaly":        int(result["is_anomaly"]),
+            "transformer_score": round(result["normalized_scores"]["transformer"], 4),
+            "mlp_score":         round(result["normalized_scores"]["mlp_autoencoder"], 4),
+            "if_score":          round(result["normalized_scores"]["isolation_forest"], 4),
+        })
+
+    results = pd.DataFrame(rows)
     if "timestamp" in df.columns:
         results.insert(0, "timestamp", df["timestamp"].values)
-
     return results
 
 
@@ -105,30 +130,31 @@ def run_inference(df: pd.DataFrame, model, scaler, threshold: float,
 # Summary
 # ─────────────────────────────────────────────────────────────
 
-def print_summary(results: pd.DataFrame, threshold: float, cfg: Config):
+def print_summary(results: pd.DataFrame, cfg: Config):
     n_total   = len(results)
-    scoreable = results["anomaly_score"] > 0          # exclude buffering rows
-    n_scored  = scoreable.sum()
+    scored    = results["ensemble_score"] > 0
+    n_scored  = scored.sum()
     n_anomaly = results["is_anomaly"].sum()
 
-    print("\n" + "=" * 55)
-    print("  INFERENCE SUMMARY")
-    print("=" * 55)
-    print(f"  Total rows        : {n_total:,}")
-    print(f"  Scoreable rows    : {n_scored:,}  "
-          f"(first {cfg.WINDOW_SIZE - 1} rows need buffer warm-up)")
-    print(f"  Anomaly threshold : {threshold:.6f}")
-    print(f"  Anomalies flagged : {n_anomaly:,}  "
+    print("\n" + "=" * 60)
+    print("  ENSEMBLE INFERENCE SUMMARY")
+    print("=" * 60)
+    print(f"  Total rows          : {n_total:,}")
+    print(f"  Scoreable rows      : {n_scored:,}  "
+          f"(first {cfg.WINDOW_SIZE - 1} rows = buffer warm-up)")
+    print(f"  Ensemble threshold  : {cfg.ENSEMBLE_THRESHOLD}")
+    print(f"  Anomalies flagged   : {n_anomaly:,}  "
           f"({100 * n_anomaly / max(n_scored, 1):.2f}% of scored rows)")
 
     if n_anomaly > 0:
+        cols = ["timestamp", "ensemble_score", "transformer_score",
+                "mlp_score", "if_score"] if "timestamp" in results.columns \
+               else ["ensemble_score", "transformer_score", "mlp_score", "if_score"]
         top = (results[results["is_anomaly"] == 1]
-               .nlargest(5, "anomaly_score")
-               [["timestamp", "anomaly_score"] if "timestamp" in results.columns
-                else ["anomaly_score"]])
-        print(f"\n  Top anomalous rows (highest score):")
+               .nlargest(5, "ensemble_score")[cols])
+        print(f"\n  Top 5 anomalous rows (highest ensemble score):")
         print(top.to_string(index=False))
-    print("=" * 55)
+    print("=" * 60)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -137,20 +163,14 @@ def print_summary(results: pd.DataFrame, threshold: float, cfg: Config):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run anomaly detection inference on a telemetry CSV."
+        description="Run ensemble anomaly detection inference on a telemetry CSV."
     )
-    parser.add_argument(
-        "--input", required=True,
-        help="Path to input telemetry CSV (must contain all 37 KPI columns)."
-    )
-    parser.add_argument(
-        "--output", default=None,
-        help="Path to save results CSV. Defaults to <input>_predictions.csv"
-    )
-    parser.add_argument(
-        "--threshold", type=float, default=None,
-        help="Override the saved anomaly threshold (optional)."
-    )
+    parser.add_argument("--input",     required=True,
+                        help="Path to input telemetry CSV.")
+    parser.add_argument("--output",    default=None,
+                        help="Output CSV path. Defaults to <input>_predictions.csv")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Override ensemble threshold (default: from config).")
     return parser.parse_args()
 
 
@@ -159,33 +179,31 @@ def main():
     cfg    = Config()
     device = get_device()
 
-    print(f"Device    : {device}")
-    print(f"Input     : {args.input}")
-
-    # -- Load artefacts ----------------------------------------
-    model, scaler, threshold = load_artefacts(cfg, device)
     if args.threshold is not None:
-        print(f"Threshold : {args.threshold:.6f}  (overridden, saved={threshold:.6f})")
-        threshold = args.threshold
-    else:
-        print(f"Threshold : {threshold:.6f}  (from checkpoints/threshold.npy)")
+        cfg.ENSEMBLE_THRESHOLD = args.threshold
 
-    # -- Load & validate input ---------------------------------
+    print(f"Device              : {device}")
+    print(f"Input               : {args.input}")
+    print(f"Ensemble threshold  : {cfg.ENSEMBLE_THRESHOLD}")
+    print(f"Weights             : Transformer={cfg.ENSEMBLE_WEIGHTS['transformer']}  "
+          f"MLP={cfg.ENSEMBLE_WEIGHTS['mlp_autoencoder']}  "
+          f"IF={cfg.ENSEMBLE_WEIGHTS['isolation_forest']}")
+
+    detector = load_ensemble(cfg, device)
+    scaler   = load_scaler()
+
     df = pd.read_csv(args.input)
-    print(f"Rows      : {len(df):,}  |  Columns: {len(df.columns)}")
+    print(f"\nRows: {len(df):,}  |  Columns: {len(df.columns)}")
     validate_input(df, cfg)
 
-    # -- Run inference -----------------------------------------
-    print("\nRunning inference...")
-    results = run_inference(df, model, scaler, threshold, cfg, device)
+    print("Running ensemble inference...")
+    results  = run_inference(df, detector, scaler, cfg)
 
-    # -- Save results ------------------------------------------
     out_path = args.output or args.input.replace(".csv", "_predictions.csv")
     results.to_csv(out_path, index=False)
     print(f"Results saved -> {out_path}")
 
-    # -- Print summary -----------------------------------------
-    print_summary(results, threshold, cfg)
+    print_summary(results, cfg)
 
 
 if __name__ == "__main__":

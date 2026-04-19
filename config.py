@@ -105,11 +105,36 @@ class Config:
     # Threshold = mean(train_errors) + THRESHOLD_SIGMA × std(train_errors)
     THRESHOLD_SIGMA = 5.0
 
+    # -- Ensemble ---------------------------------------------
+    # Weighted vote across all three detectors.
+    # Weights must sum to 1.0.
+    ENSEMBLE_WEIGHTS = {
+        "transformer":      0.50,   # highest weight — best temporal modelling
+        "mlp_autoencoder":  0.30,   # complementary feedforward view
+        "isolation_forest": 0.20,   # tree-based, catches point anomalies
+    }
+    # Ensemble score ∈ [0, 1]. Flag anomaly if score exceeds this.
+    ENSEMBLE_THRESHOLD = 0.80
+
+    # -- NOC Alert API ----------------------------------------
+    NOC_ALERTS_ENABLED    = True
+    NOC_ALERT_ENDPOINT    = "https://noc.example.com/api/v1/alerts"  # override via env NOC_ALERT_ENDPOINT
+    NOC_API_KEY           = ""                                         # override via env NOC_API_KEY
+    NOC_TIMEOUT_SEC       = 5
+    NOC_SEVERITY_THRESHOLDS = {
+        "LOW":    0.50,   # ensemble score ≥ 0.50
+        "MEDIUM": 0.70,   # ensemble score ≥ 0.70
+        "HIGH":   0.85,   # ensemble score ≥ 0.85
+    }
+
     # -- Pipeline (live simulation) ----------------------------
     SIMULATE_SPEED_FACTOR = 100     # 1 real second = 100× feed time (for demo)
 
     # -- Paths -------------------------------------------------
-    DATA_PATH      = "data/telemetry.csv"
-    ANOMALY_PATH   = "data/anomaly_labels.csv"
-    MODEL_PATH     = "checkpoints/best_model.pt"
-    RESULTS_PATH   = "results/"
+    DATA_PATH         = "data/telemetry.csv"
+    ANOMALY_PATH      = "data/anomaly_labels.csv"
+    MODEL_PATH        = "checkpoints/best_model.pt"
+    MLP_MODEL_PATH    = "checkpoints/mlp_model.pt"
+    IF_PATH           = "checkpoints/isolation_forest.pkl"
+    ENSEMBLE_PATH     = "checkpoints/ensemble_params.pkl"
+    RESULTS_PATH      = "results/"

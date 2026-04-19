@@ -11,10 +11,12 @@ from config import Config, get_device
 
 
 class Trainer:
-    def __init__(self, model: nn.Module, cfg: Config = None, device: str = None):
-        self.cfg    = cfg or Config()
-        self.device = device or get_device()
-        self.model  = model.to(self.device)
+    def __init__(self, model: nn.Module, cfg: Config = None,
+                 device: str = None, model_path: str = None):
+        self.cfg        = cfg or Config()
+        self.device     = device or get_device()
+        self.model      = model.to(self.device)
+        self.model_path = model_path or self.cfg.MODEL_PATH
         self.criterion  = nn.MSELoss()
         self.optimizer  = Adam(model.parameters(), lr=self.cfg.LEARNING_RATE)
         self.scheduler  = ReduceLROnPlateau(
@@ -44,8 +46,9 @@ class Trainer:
         return total_loss / len(loader.dataset)
 
     def fit(self, train_loader, val_loader):
-        os.makedirs(os.path.dirname(self.cfg.MODEL_PATH), exist_ok=True)
-        print(f"\nTraining on {self.device} | Model: {self.cfg.MODEL_TYPE.upper()}")
+        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+        model_name = os.path.basename(self.model_path).replace(".pt", "").upper()
+        print(f"\nTraining on {self.device} | Model: {model_name}")
         print(f"{'Epoch':>6} {'Train Loss':>12} {'Val Loss':>12} {'Time':>8}")
         print("-" * 44)
 
@@ -66,14 +69,14 @@ class Trainer:
             if improved:
                 self.best_val_loss  = val_loss
                 self.patience_count = 0
-                torch.save(self.model.state_dict(), self.cfg.MODEL_PATH)
+                torch.save(self.model.state_dict(), self.model_path)
             else:
                 self.patience_count += 1
                 if self.patience_count >= self.cfg.PATIENCE:
                     print(f"\nEarly stopping at epoch {epoch}.")
                     break
 
-        print(f"\nBest val loss: {self.best_val_loss:.6f}  ->  {self.cfg.MODEL_PATH}")
+        print(f"\nBest val loss: {self.best_val_loss:.6f}  ->  {self.model_path}")
         return self.train_losses, self.val_losses
 
     def compute_threshold(self, train_loader) -> tuple:
